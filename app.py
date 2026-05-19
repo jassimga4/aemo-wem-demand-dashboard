@@ -214,6 +214,113 @@ def forecast_ets(daily_parquet: bytes, test_days: int, horizon_days: int):
     test_out   = test.rename(columns={"ts": "ds", "operational_demand_mw": "y"})
     return train_out, test_out, fc, metrics
 
+
+@st.cache_data(show_spinner=False)
+def forecast_naive(daily_parquet: bytes, test_days: int, horizon_days: int, season: int = 7):
+    """Seasonal naive: ŷ(t+h) = y(t + h - k·S) for the smallest k giving a past observation.
+    CI width scales as sqrt(ceil(h/S)) — a standard seasonal-naive interval.
+    """
+    daily = pd.read_parquet(io.BytesIO(daily_parquet))
+    daily["ts"] = pd.to_datetime(daily["ts"]).dt.tz_localize(None)
+    daily = daily.dropna(subset=["operational_demand_mw"]).sort_values("ts")
+
+    cutoff = daily["ts"].max() - pd.Timedelta(days=test_days)
+    train = daily[daily["ts"] <= cutoff].copy()
+    test  = daily[daily["ts"] > cutoff].copy()
+
+    series = train.set_index("ts")["operational_demand_mw"]
+
+    # Estimate sigma from in-sample seasonal-naive residuals
+    naive_resid = series - series.shift(season)
+    sigma = float(naive_resid.dropna().std())
+
+    full = daily.set_index("ts")["operational_demand_mw"]
+    steps = test_days + horizon_days
+    fc_dates = pd.date_range(
+        train["ts"].max() + pd.Timedelta(days=1), periods=steps, freq="D"
+    )
+
+    yhat = []
+    for d in fc_dates:
+        # Walk back in multiples of season until we find an observed value
+        lookup = d - pd.Timedelta(days=season)
+        while lookup not in full.index and lookup >= full.index.min():
+            lookup -= pd.Timedelta(days=season)
+        yhat.append(float(full.get(lookup, np.nan)))
+
+    yhat = np.array(yhat)
+    h = np.arange(1, steps + 1)
+    margin = 1.96 * sigma * np.sqrt(np.ceil(h / season).astype(float))
+
+    fc = pd.DataFrame({
+        "ds": fc_dates,
+        "yhat": yhat,
+        "yhat_lower": yhat - margin,
+        "yhat_upper": yhat + margin,
+    })
+
+    merged = test.set_index("ts").rename_axis("ds").join(
+        fc[fc["ds"].isin(test["ts"])].set_index("ds"), how="inner"
+    )
+    merged.columns = [c.replace("operational_demand_mw", "y") for c in merged.columns]
+    metrics   = _metrics(merged["y"].values, merged["yhat"].values) if not merged.empty else {}
+    train_out = train.rename(columns={"ts": "ds", "operational_demand_mw": "y"})
+    test_out  = test.rename(columns={"ts": "ds", "operational_demand_mw": "y"})
+    return train_out, test_out, fc, metrics
+
+
+@st.cache_data(show_spinner=False)
+def forecast_sarima(
+    daily_parquet: bytes,
+    test_days: int,
+    horizon_days: int,
+    p: int = 1, d: int = 1, q: int = 1,
+    P: int = 1, D: int = 1, Q: int = 1,
+    s: int = 7,
+):
+    """SARIMA(p,d,q)(P,D,Q)[s] fit via statsmodels SARIMAX."""
+    from statsmodels.tsa.statespace.sarimax import SARIMAX
+
+    daily = pd.read_parquet(io.BytesIO(daily_parquet))
+    daily["ts"] = pd.to_datetime(daily["ts"]).dt.tz_localize(None)
+    daily = daily.dropna(subset=["operational_demand_mw"])
+
+    cutoff = daily["ts"].max() - pd.Timedelta(days=test_days)
+    train = daily[daily["ts"] <= cutoff].copy()
+    test  = daily[daily["ts"] > cutoff].copy()
+
+    series = train.set_index("ts")["operational_demand_mw"].asfreq("D")
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        model = SARIMAX(
+            series,
+            order=(p, d, q),
+            seasonal_order=(P, D, Q, s),
+            enforce_stationarity=False,
+            enforce_invertibility=False,
+        ).fit(disp=False)
+
+    steps = test_days + horizon_days
+    fcast = model.get_forecast(steps=steps)
+    ci    = fcast.conf_int(alpha=0.05)
+
+    fc = pd.DataFrame({
+        "ds": pd.date_range(train["ts"].max() + pd.Timedelta(days=1), periods=steps, freq="D"),
+        "yhat": fcast.predicted_mean.values,
+        "yhat_lower": ci.iloc[:, 0].values,
+        "yhat_upper": ci.iloc[:, 1].values,
+    })
+
+    merged = test.set_index("ts").rename_axis("ds").join(
+        fc[fc["ds"].isin(test["ts"])].set_index("ds"), how="inner"
+    )
+    merged.columns = [c.replace("operational_demand_mw", "y") for c in merged.columns]
+    metrics   = _metrics(merged["y"].values, merged["yhat"].values) if not merged.empty else {}
+    train_out = train.rename(columns={"ts": "ds", "operational_demand_mw": "y"})
+    test_out  = test.rename(columns={"ts": "ds", "operational_demand_mw": "y"})
+    return train_out, test_out, fc, metrics
+
 # ─── Chart helpers ─────────────────────────────────────────────────────────────
 
 def _forecast_chart(train, test, fc, test_days, horizon_days, model_name) -> go.Figure:
@@ -537,17 +644,46 @@ def _tab_recent(df: pd.DataFrame) -> None:
 
 # ─── Tab: Forecast ────────────────────────────────────────────────────────────
 
+_MODEL_OPTIONS = ["Seasonal Naive", "Holt-Winters (ETS)", "SARIMA", "Prophet"]
+
+
 def _tab_forecast(df: pd.DataFrame) -> None:
     st.subheader("Demand Forecast")
     st.caption("Trains on **daily-averaged** demand. Model fit on all loaded data minus the test window.")
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        model_name = st.selectbox("Model", ["Prophet","Holt-Winters (ETS)"], key="fc_model")
+        model_name = st.selectbox("Model", _MODEL_OPTIONS, key="fc_model")
     with c2:
-        test_days  = st.slider("Test window (days)", 7, 90, 30, key="fc_test")
+        test_days = st.slider("Test window (days)", 7, 90, 30, key="fc_test")
     with c3:
-        horizon    = st.slider("Forecast horizon (days)", 7, 180, 60, key="fc_horizon")
+        horizon = st.slider("Forecast horizon (days)", 7, 180, 60, key="fc_horizon")
+
+    # SARIMA-specific order controls
+    sarima_params: dict = {}
+    if model_name == "SARIMA":
+        with st.expander("SARIMA order  (p,d,q)(P,D,Q)[7]", expanded=True):
+            st.caption("Non-seasonal (p,d,q) and seasonal (P,D,Q) orders. Seasonal period s is fixed to **7** (weekly).")
+            a1, a2, a3, a4, a5, a6 = st.columns(6)
+            sarima_params = {
+                "p": a1.number_input("p", 0, 3, 1, key="fc_p"),
+                "d": a2.number_input("d", 0, 2, 1, key="fc_d"),
+                "q": a3.number_input("q", 0, 3, 1, key="fc_q"),
+                "P": a4.number_input("P", 0, 2, 1, key="fc_P"),
+                "D": a5.number_input("D", 0, 2, 1, key="fc_D"),
+                "Q": a6.number_input("Q", 0, 2, 1, key="fc_Q"),
+            }
+
+    # Seasonal Naive seasonality toggle
+    naive_season = 7
+    if model_name == "Seasonal Naive":
+        naive_season = st.radio(
+            "Seasonal period",
+            [7, 365],
+            format_func=lambda s: f"Weekly (S={s})" if s == 7 else f"Yearly (S={s}, needs ≥2y data)",
+            horizontal=True,
+            key="fc_naive_season",
+        )
 
     run_btn = st.button("Run forecast", type="primary", key="fc_run")
 
@@ -557,16 +693,22 @@ def _tab_forecast(df: pd.DataFrame) -> None:
 
     if run_btn:
         daily = _to_daily(df)
-        buf   = io.BytesIO()
-        daily[["ts","operational_demand_mw"]].to_parquet(buf, index=False)
+        buf = io.BytesIO()
+        daily[["ts", "operational_demand_mw"]].to_parquet(buf, index=False)
         parquet_bytes = buf.getvalue()
 
-        with st.spinner(f"Training {model_name}…"):
+        with st.spinner(f"Running {model_name}…"):
             try:
                 if model_name == "Prophet":
                     train, test, fc, metrics = forecast_prophet(parquet_bytes, test_days, horizon)
-                else:
+                elif model_name == "Holt-Winters (ETS)":
                     train, test, fc, metrics = forecast_ets(parquet_bytes, test_days, horizon)
+                elif model_name == "Seasonal Naive":
+                    train, test, fc, metrics = forecast_naive(parquet_bytes, test_days, horizon, season=naive_season)
+                else:  # SARIMA
+                    train, test, fc, metrics = forecast_sarima(
+                        parquet_bytes, test_days, horizon, **{k: int(v) for k, v in sarima_params.items()}
+                    )
                 st.session_state["fc_result"] = (train, test, fc, metrics, model_name, horizon, test_days)
             except ImportError as exc:
                 lib = "prophet" if model_name == "Prophet" else "statsmodels"
@@ -588,14 +730,14 @@ def _tab_forecast(df: pd.DataFrame) -> None:
                     use_container_width=True)
 
     future_only = fc[fc["ds"] > (test["ds"].max() if not test.empty else train["ds"].max())].copy()
-    future_only.columns = ["date","forecast_mw","lower_95_mw","upper_95_mw"]
+    future_only.columns = ["date", "forecast_mw", "lower_95_mw", "upper_95_mw"]
     st.download_button(f"Download {horizon}-day forecast CSV",
                        future_only.to_csv(index=False).encode(),
                        "aemo_forecast.csv", "text/csv")
 
     with st.expander("Full forecast table"):
-        st.dataframe(fc.rename(columns={"ds":"date","yhat":"forecast_mw",
-                                        "yhat_lower":"lower_95_mw","yhat_upper":"upper_95_mw"}),
+        st.dataframe(fc.rename(columns={"ds": "date", "yhat": "forecast_mw",
+                                        "yhat_lower": "lower_95_mw", "yhat_upper": "upper_95_mw"}),
                      use_container_width=True)
 
 # ─── Tab: Analysis ────────────────────────────────────────────────────────────

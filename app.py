@@ -34,6 +34,9 @@ DPV_FIRST_YEAR    = 2020   # distributed PV data starts here
 
 DATA_DIR = Path("data")
 
+PERTH_LAT = -31.9505
+PERTH_LON = 115.8605
+
 # ─── Path helpers ──────────────────────────────────────────────────────────────
 
 def _demand_path(year: int) -> Path:
@@ -79,6 +82,188 @@ def _localise(ts: pd.Series) -> pd.Series:
     #   nonexistent="shift_forward" — clocks spring forward (Oct): missing interval → shift to next
     #   ambiguous="NaT"            — clocks fall back (Mar): duplicate timestamp → drop (≤1 row/year)
     return ts.dt.tz_localize("Australia/Perth", nonexistent="shift_forward", ambiguous="NaT")
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_weather_daily(start_date: str, end_date: str) -> pd.DataFrame:
+    """Fetch daily weather from Open-Meteo (historical + forecast) for Perth.
+
+    Returns DataFrame with columns: date, temp_max, temp_min, radiation.
+    Returns empty DataFrame on any failure.
+    """
+    try:
+        daily_vars = "temperature_2m_max,temperature_2m_min,shortwave_radiation_sum"
+        frames = []
+
+        # Historical archive
+        try:
+            r = requests.get(
+                "https://archive-api.open-meteo.com/v1/archive",
+                params={
+                    "latitude": PERTH_LAT,
+                    "longitude": PERTH_LON,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "daily": daily_vars,
+                    "timezone": "Australia/Perth",
+                },
+                timeout=30,
+                verify=False,
+            )
+            r.raise_for_status()
+            data = r.json()
+            if "daily" in data:
+                d = data["daily"]
+                frames.append(pd.DataFrame({
+                    "date": pd.to_datetime(d["time"]),
+                    "temp_max": d["temperature_2m_max"],
+                    "temp_min": d["temperature_2m_min"],
+                    "radiation": d["shortwave_radiation_sum"],
+                }))
+        except Exception:
+            pass
+
+        # Forecast (up to 16 days ahead)
+        try:
+            r2 = requests.get(
+                "https://api.open-meteo.com/v1/forecast",
+                params={
+                    "latitude": PERTH_LAT,
+                    "longitude": PERTH_LON,
+                    "daily": daily_vars,
+                    "timezone": "Australia/Perth",
+                    "forecast_days": 16,
+                },
+                timeout=30,
+                verify=False,
+            )
+            r2.raise_for_status()
+            data2 = r2.json()
+            if "daily" in data2:
+                d2 = data2["daily"]
+                frames.append(pd.DataFrame({
+                    "date": pd.to_datetime(d2["time"]),
+                    "temp_max": d2["temperature_2m_max"],
+                    "temp_min": d2["temperature_2m_min"],
+                    "radiation": d2["shortwave_radiation_sum"],
+                }))
+        except Exception:
+            pass
+
+        if not frames:
+            return pd.DataFrame()
+
+        combined = pd.concat(frames, ignore_index=True)
+        combined["date"] = combined["date"].dt.tz_localize(None)
+        combined = combined.drop_duplicates(subset=["date"]).sort_values("date").reset_index(drop=True)
+
+        # Fill NaN beyond forecast coverage using 7-period seasonal repeat, then ffill/bfill
+        for col in ["temp_max", "temp_min", "radiation"]:
+            mask = combined[col].isna()
+            if mask.any():
+                filled = combined[col].copy()
+                for i in combined.index[mask]:
+                    lookback = i - 7
+                    if lookback >= 0 and not pd.isna(filled.iloc[lookback]):
+                        filled.iloc[i] = filled.iloc[lookback]
+                combined[col] = filled
+        combined = combined.ffill().bfill()
+
+        return combined
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_weather_halfhourly(start_date: str, end_date: str) -> pd.DataFrame:
+    """Fetch hourly weather from Open-Meteo (historical + forecast) for Perth,
+    resampled to 30-minute intervals via linear interpolation.
+
+    Returns DataFrame with columns: ts, temp, radiation.
+    Returns empty DataFrame on any failure.
+    """
+    try:
+        hourly_vars = "temperature_2m,shortwave_radiation"
+        frames = []
+
+        # Historical archive
+        try:
+            r = requests.get(
+                "https://archive-api.open-meteo.com/v1/archive",
+                params={
+                    "latitude": PERTH_LAT,
+                    "longitude": PERTH_LON,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "hourly": hourly_vars,
+                    "timezone": "Australia/Perth",
+                },
+                timeout=30,
+                verify=False,
+            )
+            r.raise_for_status()
+            data = r.json()
+            if "hourly" in data:
+                h = data["hourly"]
+                frames.append(pd.DataFrame({
+                    "ts": pd.to_datetime(h["time"]),
+                    "temp": h["temperature_2m"],
+                    "radiation": h["shortwave_radiation"],
+                }))
+        except Exception:
+            pass
+
+        # Forecast (up to 16 days ahead)
+        try:
+            r2 = requests.get(
+                "https://api.open-meteo.com/v1/forecast",
+                params={
+                    "latitude": PERTH_LAT,
+                    "longitude": PERTH_LON,
+                    "hourly": hourly_vars,
+                    "timezone": "Australia/Perth",
+                    "forecast_days": 16,
+                },
+                timeout=30,
+                verify=False,
+            )
+            r2.raise_for_status()
+            data2 = r2.json()
+            if "hourly" in data2:
+                h2 = data2["hourly"]
+                frames.append(pd.DataFrame({
+                    "ts": pd.to_datetime(h2["time"]),
+                    "temp": h2["temperature_2m"],
+                    "radiation": h2["shortwave_radiation"],
+                }))
+        except Exception:
+            pass
+
+        if not frames:
+            return pd.DataFrame()
+
+        combined = pd.concat(frames, ignore_index=True)
+        combined["ts"] = combined["ts"].dt.tz_localize(None)
+        combined = combined.drop_duplicates(subset=["ts"]).sort_values("ts").set_index("ts")
+
+        # Resample to 30-min with linear interpolation
+        combined_30 = combined.resample("30min").interpolate(method="linear").reset_index()
+
+        # Fill NaN beyond forecast coverage using 336-period seasonal repeat (7 days * 48 slots)
+        for col in ["temp", "radiation"]:
+            mask = combined_30[col].isna()
+            if mask.any():
+                filled = combined_30[col].copy()
+                for i in combined_30.index[mask]:
+                    lookback = i - 336
+                    if lookback >= 0 and not pd.isna(filled.iloc[lookback]):
+                        filled.iloc[i] = filled.iloc[lookback]
+                combined_30[col] = filled
+        combined_30 = combined_30.ffill().bfill()
+
+        return combined_30
+    except Exception:
+        return pd.DataFrame()
 
 
 def _parse_demand(raw: bytes, year: int) -> pd.DataFrame:
@@ -155,7 +340,8 @@ def _metrics(actual: np.ndarray, pred: np.ndarray) -> dict[str, float]:
 
 
 @st.cache_data(show_spinner=False)
-def forecast_prophet(parquet_bytes: bytes, test_days: int, horizon_days: int, freq: str = "1D"):
+def forecast_prophet(parquet_bytes: bytes, test_days: int, horizon_days: int,
+                     freq: str = "1D", *, weather_parquet: bytes | None = None):
     from prophet import Prophet
 
     df = pd.read_parquet(io.BytesIO(parquet_bytes))
@@ -164,6 +350,47 @@ def forecast_prophet(parquet_bytes: bytes, test_days: int, horizon_days: int, fr
 
     cutoff = prop["ds"].max() - pd.Timedelta(days=test_days)
     train, test = prop[prop["ds"] <= cutoff].copy(), prop[prop["ds"] > cutoff].copy()
+
+    # Determine weather regressors to use
+    weather_cols: list[str] = []
+    weather_df: pd.DataFrame | None = None
+    if weather_parquet is not None:
+        try:
+            wdf = pd.read_parquet(io.BytesIO(weather_parquet))
+            if freq == "1D":
+                weather_cols = ["temp_max", "temp_min", "radiation"]
+                if all(c in wdf.columns for c in weather_cols):
+                    wdf["date"] = pd.to_datetime(wdf["date"]).dt.normalize()
+                    weather_df = wdf[["date"] + weather_cols].copy()
+                    # Join weather onto train via date
+                    train["_date"] = train["ds"].dt.normalize()
+                    train = train.merge(weather_df.rename(columns={"date": "_date"}),
+                                       on="_date", how="left").drop(columns=["_date"])
+                    train[weather_cols] = train[weather_cols].ffill().bfill()
+                    # Check any col all-NaN → skip weather
+                    if any(train[c].isna().all() for c in weather_cols):
+                        weather_cols = []
+                        weather_df = None
+                        for c in ["temp_max", "temp_min", "radiation"]:
+                            if c in train.columns:
+                                train = train.drop(columns=[c])
+            else:
+                weather_cols = ["temp", "radiation"]
+                if all(c in wdf.columns for c in weather_cols):
+                    wdf["ts"] = pd.to_datetime(wdf["ts"]).dt.tz_localize(None)
+                    weather_df = wdf[["ts"] + weather_cols].copy()
+                    train = train.merge(weather_df.rename(columns={"ts": "ds"}),
+                                       on="ds", how="left")
+                    train[weather_cols] = train[weather_cols].ffill().bfill()
+                    if any(train[c].isna().all() for c in weather_cols):
+                        weather_cols = []
+                        weather_df = None
+                        for c in ["temp", "radiation"]:
+                            if c in train.columns:
+                                train = train.drop(columns=[c])
+        except Exception:
+            weather_cols = []
+            weather_df = None
 
     is_subday = freq != "1D"
     with warnings.catch_warnings():
@@ -175,10 +402,34 @@ def forecast_prophet(parquet_bytes: bytes, test_days: int, horizon_days: int, fr
             interval_width=0.95,
             changepoint_prior_scale=0.05,
         )
+        for col in weather_cols:
+            m.add_regressor(col)
         m.fit(train)
 
     steps = (test_days + horizon_days) * _STEPS_PER_DAY[freq]
     future = m.make_future_dataframe(periods=steps, freq=freq)
+
+    # Merge weather onto future dataframe
+    if weather_cols and weather_df is not None:
+        try:
+            if freq == "1D":
+                future["_date"] = future["ds"].dt.normalize()
+                future = future.merge(weather_df.rename(columns={"date": "_date"}),
+                                      on="_date", how="left").drop(columns=["_date"])
+            else:
+                future = future.merge(weather_df.rename(columns={"ts": "ds"}),
+                                      on="ds", how="left")
+            future[weather_cols] = future[weather_cols].ffill().bfill()
+            # If still NaN after fill (e.g. beyond coverage), drop weather cols
+            if any(future[c].isna().any() for c in weather_cols):
+                future[weather_cols] = future[weather_cols].ffill().bfill()
+        except Exception:
+            # Weather merge failed — drop cols so Prophet doesn't crash
+            for col in weather_cols:
+                if col in future.columns:
+                    future = future.drop(columns=[col])
+            weather_cols = []
+
     fc = m.predict(future)[["ds", "yhat", "yhat_lower", "yhat_upper"]]
 
     merged = test.set_index("ds").join(
@@ -297,6 +548,8 @@ def forecast_sarima(
     P: int = 1, D: int = 1, Q: int = 1,
     s: int = 7,
     freq: str = "1D",
+    *,
+    weather_parquet: bytes | None = None,
 ):
     """SARIMA(p,d,q)(P,D,Q)[s] via statsmodels SARIMAX.
     At 30-min freq s defaults to 48 (daily); training capped to last 180d.
@@ -317,21 +570,68 @@ def forecast_sarima(
     test  = df[df["ts"] > cutoff].copy()
 
     series = train.set_index("ts")["operational_demand_mw"].asfreq(freq)
+    steps   = (test_days + horizon_days) * _STEPS_PER_DAY[freq]
+    step_td = pd.Timedelta(days=1) if freq == "1D" else pd.Timedelta(minutes=30)
+
+    # Build exogenous arrays from weather if provided
+    train_exog: np.ndarray | None = None
+    forecast_exog: np.ndarray | None = None
+    if weather_parquet is not None:
+        try:
+            wdf = pd.read_parquet(io.BytesIO(weather_parquet))
+            if freq == "1D":
+                weather_cols = ["temp_max", "temp_min", "radiation"]
+                if all(c in wdf.columns for c in weather_cols):
+                    wdf["date"] = pd.to_datetime(wdf["date"]).dt.normalize()
+                    wdf = wdf.set_index("date")
+                    # Align train
+                    train_idx = series.index.normalize()
+                    exog_train = wdf.reindex(train_idx)[weather_cols].ffill().bfill()
+                    # Forecast index
+                    fc_idx = pd.date_range(train["ts"].max() + step_td, periods=steps, freq=freq)
+                    exog_fc = wdf.reindex(fc_idx.normalize())[weather_cols].ffill().bfill()
+                    if not exog_train.isna().all(axis=None) and not exog_fc.isna().all(axis=None):
+                        train_exog = exog_train.values
+                        forecast_exog = exog_fc.values
+            else:
+                weather_cols = ["temp", "radiation"]
+                if all(c in wdf.columns for c in weather_cols):
+                    wdf["ts"] = pd.to_datetime(wdf["ts"]).dt.tz_localize(None)
+                    wdf = wdf.set_index("ts")
+                    exog_train = wdf.reindex(series.index)[weather_cols].ffill().bfill()
+                    fc_idx = pd.date_range(train["ts"].max() + step_td, periods=steps, freq=freq)
+                    exog_fc = wdf.reindex(fc_idx)[weather_cols].ffill().bfill()
+                    if not exog_train.isna().all(axis=None) and not exog_fc.isna().all(axis=None):
+                        train_exog = exog_train.values
+                        forecast_exog = exog_fc.values
+        except Exception:
+            train_exog = None
+            forecast_exog = None
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        model = SARIMAX(
-            series,
-            order=(p, d, q),
-            seasonal_order=(P, D, Q, s),
-            enforce_stationarity=False,
-            enforce_invertibility=False,
-        ).fit(disp=False)
+        try:
+            model = SARIMAX(
+                series,
+                exog=train_exog,
+                order=(p, d, q),
+                seasonal_order=(P, D, Q, s),
+                enforce_stationarity=False,
+                enforce_invertibility=False,
+            ).fit(disp=False)
+            fcast = model.get_forecast(steps=steps, exog=forecast_exog)
+        except Exception:
+            # Fall back to no exog if weather causes any error
+            model = SARIMAX(
+                series,
+                order=(p, d, q),
+                seasonal_order=(P, D, Q, s),
+                enforce_stationarity=False,
+                enforce_invertibility=False,
+            ).fit(disp=False)
+            fcast = model.get_forecast(steps=steps)
 
-    steps   = (test_days + horizon_days) * _STEPS_PER_DAY[freq]
-    step_td = pd.Timedelta(days=1) if freq == "1D" else pd.Timedelta(minutes=30)
-    fcast   = model.get_forecast(steps=steps)
-    ci      = fcast.conf_int(alpha=0.05)
+    ci = fcast.conf_int(alpha=0.05)
 
     fc = pd.DataFrame({
         "ds": pd.date_range(train["ts"].max() + step_td, periods=steps, freq=freq),
@@ -753,6 +1053,12 @@ def _tab_forecast(df: pd.DataFrame) -> None:
                 key="fc_naive_season",
             )
 
+    # ── Weather regressors toggle (Prophet / SARIMA only) ────────────────────
+    use_weather = False
+    if model_name in ("Prophet", "SARIMA"):
+        use_weather = st.checkbox("🌡️ Weather regressors (Open-Meteo)", value=False,
+                                  key="fc_weather")
+
     run_btn = st.button("Run forecast", type="primary", key="fc_run")
 
     if not run_btn and "fc_result" not in st.session_state:
@@ -772,10 +1078,39 @@ def _tab_forecast(df: pd.DataFrame) -> None:
         data[["ts", "operational_demand_mw"]].to_parquet(buf, index=False)
         parquet_bytes = buf.getvalue()
 
+        # Fetch weather if requested
+        weather_parquet: bytes | None = None
+        if use_weather and model_name in ("Prophet", "SARIMA"):
+            try:
+                _data_ts = data["ts"].dt.tz_localize(None) if data["ts"].dt.tz is not None else data["ts"]
+                w_start = _data_ts.min().strftime("%Y-%m-%d")
+                w_end   = (_data_ts.max() + pd.Timedelta(days=horizon)).strftime("%Y-%m-%d")
+                with st.spinner("Fetching weather data from Open-Meteo…"):
+                    if freq == "1D":
+                        wdf = fetch_weather_daily(w_start, w_end)
+                    else:
+                        wdf = fetch_weather_halfhourly(w_start, w_end)
+                if wdf.empty:
+                    st.warning("Weather fetch returned no data — running without weather regressors.")
+                else:
+                    date_col = "date" if freq == "1D" else "ts"
+                    w_min = pd.to_datetime(wdf[date_col]).min().strftime("%Y-%m-%d")
+                    w_max = pd.to_datetime(wdf[date_col]).max().strftime("%Y-%m-%d")
+                    st.caption(f"Weather: {w_min} → {w_max}, {len(wdf):,} rows, last fetched live")
+                    w_buf = io.BytesIO()
+                    wdf.to_parquet(w_buf, index=False)
+                    weather_parquet = w_buf.getvalue()
+            except Exception as exc:
+                st.warning(f"Weather fetch failed ({exc}) — running without weather regressors.")
+                weather_parquet = None
+
         with st.spinner(f"Running {model_name} at {freq} resolution…"):
             try:
                 if model_name == "Prophet":
-                    train, test, fc, metrics = forecast_prophet(parquet_bytes, test_days, horizon, freq=freq)
+                    train, test, fc, metrics = forecast_prophet(
+                        parquet_bytes, test_days, horizon, freq=freq,
+                        weather_parquet=weather_parquet,
+                    )
                 elif model_name == "Holt-Winters (ETS)":
                     train, test, fc, metrics = forecast_ets(parquet_bytes, test_days, horizon, freq=freq)
                 elif model_name == "Seasonal Naive":
@@ -786,8 +1121,9 @@ def _tab_forecast(df: pd.DataFrame) -> None:
                         parquet_bytes, test_days, horizon,
                         **{k: int(v) for k, v in sarima_params.items()},
                         freq=freq,
+                        weather_parquet=weather_parquet,
                     )
-                st.session_state["fc_result"] = (train, test, fc, metrics, model_name, horizon, test_days, freq)
+                st.session_state["fc_result"] = (train, test, fc, metrics, model_name, horizon, test_days, freq, weather_parquet)
             except ImportError as exc:
                 lib = "prophet" if model_name == "Prophet" else "statsmodels"
                 st.error(f"{model_name} not installed. Run: `pip install {lib}`\n\n`{exc}`")
@@ -798,8 +1134,9 @@ def _tab_forecast(df: pd.DataFrame) -> None:
 
     result = st.session_state["fc_result"]
     train, test, fc, metrics, model_name, horizon, test_days = result[:7]
-    saved_freq = result[7] if len(result) > 7 else "1D"
-    saved_spd  = _STEPS_PER_DAY[saved_freq]
+    saved_freq          = result[7] if len(result) > 7 else "1D"
+    saved_weather_parquet = result[8] if len(result) > 8 else None
+    saved_spd           = _STEPS_PER_DAY[saved_freq]
 
     if metrics:
         m1, m2, m3 = st.columns(3)

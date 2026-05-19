@@ -75,7 +75,10 @@ def ensure_dpv_cached(year: int, *, force: bool = False) -> Path:
 # ─── CSV parsers ───────────────────────────────────────────────────────────────
 
 def _localise(ts: pd.Series) -> pd.Series:
-    return ts.dt.tz_localize("Australia/Perth", nonexistent="shift_forward")
+    # WA trialled DST 2006-2009. Two edge cases arise:
+    #   nonexistent="shift_forward" — clocks spring forward (Oct): missing interval → shift to next
+    #   ambiguous="NaT"            — clocks fall back (Mar): duplicate timestamp → drop (≤1 row/year)
+    return ts.dt.tz_localize("Australia/Perth", nonexistent="shift_forward", ambiguous="NaT")
 
 
 def _parse_demand(raw: bytes, year: int) -> pd.DataFrame:

@@ -807,8 +807,9 @@ def _tab_forecast(df: pd.DataFrame) -> None:
         m2.metric("RMSE", f"{metrics.get('RMSE (MW)', 0):,.1f} MW")
         m3.metric("MAPE", f"{metrics.get('MAPE (%)', 0):.2f} %")
 
-    # Show last 90 days of history at 30-min (=4 320 rows), last 365 days at daily
-    hist_rows = 90 * saved_spd
+    # Daily: show full year of history (365 rows).
+    # 30-min: cap at 90 days = 4 320 rows to keep Plotly responsive.
+    hist_rows = 365 if saved_freq == "1D" else 90 * 48
     st.plotly_chart(
         _forecast_chart(train, test, fc, test_days, horizon, model_name, hist_rows=hist_rows),
         use_container_width=True,

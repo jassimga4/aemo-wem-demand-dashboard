@@ -137,6 +137,10 @@ def _to_daily(df: pd.DataFrame) -> pd.DataFrame:
 
 # ─── Forecasting ───────────────────────────────────────────────────────────────
 
+# Intervals per day for each supported forecast frequency
+_STEPS_PER_DAY = {"1D": 1, "30min": 48}
+
+
 def _metrics(actual: np.ndarray, pred: np.ndarray) -> dict[str, float]:
     if not _SKLEARN_OK:
         return {}
@@ -148,24 +152,30 @@ def _metrics(actual: np.ndarray, pred: np.ndarray) -> dict[str, float]:
 
 
 @st.cache_data(show_spinner=False)
-def forecast_prophet(daily_parquet: bytes, test_days: int, horizon_days: int):
+def forecast_prophet(parquet_bytes: bytes, test_days: int, horizon_days: int, freq: str = "1D"):
     from prophet import Prophet
 
-    daily = pd.read_parquet(io.BytesIO(daily_parquet))
-    daily["ts"] = pd.to_datetime(daily["ts"]).dt.tz_localize(None)
-    prop = daily.rename(columns={"ts": "ds", "operational_demand_mw": "y"})[["ds", "y"]].dropna()
+    df = pd.read_parquet(io.BytesIO(parquet_bytes))
+    df["ts"] = pd.to_datetime(df["ts"]).dt.tz_localize(None)
+    prop = df.rename(columns={"ts": "ds", "operational_demand_mw": "y"})[["ds", "y"]].dropna()
 
     cutoff = prop["ds"].max() - pd.Timedelta(days=test_days)
     train, test = prop[prop["ds"] <= cutoff].copy(), prop[prop["ds"] > cutoff].copy()
 
+    is_subday = freq != "1D"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        m = Prophet(yearly_seasonality=True, weekly_seasonality=True,
-                    daily_seasonality=False, interval_width=0.95,
-                    changepoint_prior_scale=0.05)
+        m = Prophet(
+            yearly_seasonality=not is_subday,
+            weekly_seasonality=True,
+            daily_seasonality=is_subday,
+            interval_width=0.95,
+            changepoint_prior_scale=0.05,
+        )
         m.fit(train)
 
-    future = m.make_future_dataframe(periods=test_days + horizon_days, freq="D")
+    steps = (test_days + horizon_days) * _STEPS_PER_DAY[freq]
+    future = m.make_future_dataframe(periods=steps, freq=freq)
     fc = m.predict(future)[["ds", "yhat", "yhat_lower", "yhat_upper"]]
 
     merged = test.set_index("ds").join(
@@ -176,30 +186,39 @@ def forecast_prophet(daily_parquet: bytes, test_days: int, horizon_days: int):
 
 
 @st.cache_data(show_spinner=False)
-def forecast_ets(daily_parquet: bytes, test_days: int, horizon_days: int):
+def forecast_ets(parquet_bytes: bytes, test_days: int, horizon_days: int, freq: str = "1D"):
     from statsmodels.tsa.holtwinters import ExponentialSmoothing
 
-    daily = pd.read_parquet(io.BytesIO(daily_parquet))
-    daily["ts"] = pd.to_datetime(daily["ts"]).dt.tz_localize(None)
-    daily = daily.dropna(subset=["operational_demand_mw"])
+    df = pd.read_parquet(io.BytesIO(parquet_bytes))
+    df["ts"] = pd.to_datetime(df["ts"]).dt.tz_localize(None)
+    df = df.dropna(subset=["operational_demand_mw"])
 
-    cutoff = daily["ts"].max() - pd.Timedelta(days=test_days)
-    train = daily[daily["ts"] <= cutoff].copy()
-    test  = daily[daily["ts"] > cutoff].copy()
+    # At 30-min: S=48 (daily cycle). Cap training to last 365d to keep fit fast.
+    if freq != "1D":
+        season = 48
+        cap = df["ts"].max() - pd.Timedelta(days=test_days + 365)
+        df = df[df["ts"] >= cap].copy()
+    else:
+        season = 7
 
-    series = train.set_index("ts")["operational_demand_mw"].asfreq("D")
+    cutoff = df["ts"].max() - pd.Timedelta(days=test_days)
+    train = df[df["ts"] <= cutoff].copy()
+    test  = df[df["ts"] > cutoff].copy()
+
+    series = train.set_index("ts")["operational_demand_mw"].asfreq(freq)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         model = ExponentialSmoothing(
-            series, trend="add", seasonal="add", seasonal_periods=7,
+            series, trend="add", seasonal="add", seasonal_periods=season,
             initialization_method="estimated",
         ).fit(optimized=True, use_brute=False)
 
-    steps = test_days + horizon_days
-    pred  = model.forecast(steps)
-    sim   = model.simulate(steps, repetitions=200, error="add", random_errors="bootstrap")
-    fc    = pd.DataFrame({
-        "ds": pd.date_range(train["ts"].max() + pd.Timedelta(days=1), periods=steps, freq="D"),
+    steps     = (test_days + horizon_days) * _STEPS_PER_DAY[freq]
+    step_td   = pd.Timedelta(days=1) if freq == "1D" else pd.Timedelta(minutes=30)
+    pred      = model.forecast(steps)
+    sim       = model.simulate(steps, repetitions=100, error="add", random_errors="bootstrap")
+    fc        = pd.DataFrame({
+        "ds": pd.date_range(train["ts"].max() + step_td, periods=steps, freq=freq),
         "yhat": pred.values,
         "yhat_lower": sim.quantile(0.025, axis=1).values,
         "yhat_upper": sim.quantile(0.975, axis=1).values,
@@ -209,47 +228,44 @@ def forecast_ets(daily_parquet: bytes, test_days: int, horizon_days: int):
         fc[fc["ds"].isin(test["ts"])].set_index("ds"), how="inner"
     )
     merged.columns = [c.replace("operational_demand_mw", "y") for c in merged.columns]
-    metrics    = _metrics(merged["y"].values, merged["yhat"].values) if not merged.empty else {}
-    train_out  = train.rename(columns={"ts": "ds", "operational_demand_mw": "y"})
-    test_out   = test.rename(columns={"ts": "ds", "operational_demand_mw": "y"})
+    metrics   = _metrics(merged["y"].values, merged["yhat"].values) if not merged.empty else {}
+    train_out = train.rename(columns={"ts": "ds", "operational_demand_mw": "y"})
+    test_out  = test.rename(columns={"ts": "ds", "operational_demand_mw": "y"})
     return train_out, test_out, fc, metrics
 
 
 @st.cache_data(show_spinner=False)
-def forecast_naive(daily_parquet: bytes, test_days: int, horizon_days: int, season: int = 7):
-    """Seasonal naive: ŷ(t+h) = y(t + h - k·S) for the smallest k giving a past observation.
-    CI width scales as sqrt(ceil(h/S)) — a standard seasonal-naive interval.
+def forecast_naive(parquet_bytes: bytes, test_days: int, horizon_days: int,
+                   season: int = 7, freq: str = "1D"):
+    """Seasonal naive: ŷ(t+h) = y(t + h - k·S).
+    At daily freq season is in days (7=weekly, 365=yearly).
+    At 30-min freq season is in intervals (336=weekly, 48=daily).
     """
-    daily = pd.read_parquet(io.BytesIO(daily_parquet))
-    daily["ts"] = pd.to_datetime(daily["ts"]).dt.tz_localize(None)
-    daily = daily.dropna(subset=["operational_demand_mw"]).sort_values("ts")
+    df = pd.read_parquet(io.BytesIO(parquet_bytes))
+    df["ts"] = pd.to_datetime(df["ts"]).dt.tz_localize(None)
+    df = df.dropna(subset=["operational_demand_mw"]).sort_values("ts")
 
-    cutoff = daily["ts"].max() - pd.Timedelta(days=test_days)
-    train = daily[daily["ts"] <= cutoff].copy()
-    test  = daily[daily["ts"] > cutoff].copy()
+    cutoff = df["ts"].max() - pd.Timedelta(days=test_days)
+    train = df[df["ts"] <= cutoff].copy()
+    test  = df[df["ts"] > cutoff].copy()
 
-    series = train.set_index("ts")["operational_demand_mw"]
-
-    # Estimate sigma from in-sample seasonal-naive residuals
-    naive_resid = series - series.shift(season)
-    sigma = float(naive_resid.dropna().std())
-
-    full = daily.set_index("ts")["operational_demand_mw"]
-    steps = test_days + horizon_days
-    fc_dates = pd.date_range(
-        train["ts"].max() + pd.Timedelta(days=1), periods=steps, freq="D"
-    )
+    series     = train.set_index("ts")["operational_demand_mw"]
+    sigma      = float((series - series.shift(season)).dropna().std())
+    full       = df.set_index("ts")["operational_demand_mw"]
+    step_td    = pd.Timedelta(days=1) if freq == "1D" else pd.Timedelta(minutes=30)
+    season_td  = step_td * season
+    steps      = (test_days + horizon_days) * _STEPS_PER_DAY[freq]
+    fc_dates   = pd.date_range(train["ts"].max() + step_td, periods=steps, freq=freq)
 
     yhat = []
     for d in fc_dates:
-        # Walk back in multiples of season until we find an observed value
-        lookup = d - pd.Timedelta(days=season)
+        lookup = d - season_td
         while lookup not in full.index and lookup >= full.index.min():
-            lookup -= pd.Timedelta(days=season)
+            lookup -= season_td
         yhat.append(float(full.get(lookup, np.nan)))
 
-    yhat = np.array(yhat)
-    h = np.arange(1, steps + 1)
+    yhat   = np.array(yhat)
+    h      = np.arange(1, steps + 1)
     margin = 1.96 * sigma * np.sqrt(np.ceil(h / season).astype(float))
 
     fc = pd.DataFrame({
@@ -271,25 +287,33 @@ def forecast_naive(daily_parquet: bytes, test_days: int, horizon_days: int, seas
 
 @st.cache_data(show_spinner=False)
 def forecast_sarima(
-    daily_parquet: bytes,
+    parquet_bytes: bytes,
     test_days: int,
     horizon_days: int,
     p: int = 1, d: int = 1, q: int = 1,
     P: int = 1, D: int = 1, Q: int = 1,
     s: int = 7,
+    freq: str = "1D",
 ):
-    """SARIMA(p,d,q)(P,D,Q)[s] fit via statsmodels SARIMAX."""
+    """SARIMA(p,d,q)(P,D,Q)[s] via statsmodels SARIMAX.
+    At 30-min freq s defaults to 48 (daily); training capped to last 180d.
+    """
     from statsmodels.tsa.statespace.sarimax import SARIMAX
 
-    daily = pd.read_parquet(io.BytesIO(daily_parquet))
-    daily["ts"] = pd.to_datetime(daily["ts"]).dt.tz_localize(None)
-    daily = daily.dropna(subset=["operational_demand_mw"])
+    df = pd.read_parquet(io.BytesIO(parquet_bytes))
+    df["ts"] = pd.to_datetime(df["ts"]).dt.tz_localize(None)
+    df = df.dropna(subset=["operational_demand_mw"])
 
-    cutoff = daily["ts"].max() - pd.Timedelta(days=test_days)
-    train = daily[daily["ts"] <= cutoff].copy()
-    test  = daily[daily["ts"] > cutoff].copy()
+    # At 30-min: cap training to last 180d to keep MLE tractable
+    if freq != "1D":
+        cap = df["ts"].max() - pd.Timedelta(days=test_days + 180)
+        df = df[df["ts"] >= cap].copy()
 
-    series = train.set_index("ts")["operational_demand_mw"].asfreq("D")
+    cutoff = df["ts"].max() - pd.Timedelta(days=test_days)
+    train = df[df["ts"] <= cutoff].copy()
+    test  = df[df["ts"] > cutoff].copy()
+
+    series = train.set_index("ts")["operational_demand_mw"].asfreq(freq)
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -301,12 +325,13 @@ def forecast_sarima(
             enforce_invertibility=False,
         ).fit(disp=False)
 
-    steps = test_days + horizon_days
-    fcast = model.get_forecast(steps=steps)
-    ci    = fcast.conf_int(alpha=0.05)
+    steps   = (test_days + horizon_days) * _STEPS_PER_DAY[freq]
+    step_td = pd.Timedelta(days=1) if freq == "1D" else pd.Timedelta(minutes=30)
+    fcast   = model.get_forecast(steps=steps)
+    ci      = fcast.conf_int(alpha=0.05)
 
     fc = pd.DataFrame({
-        "ds": pd.date_range(train["ts"].max() + pd.Timedelta(days=1), periods=steps, freq="D"),
+        "ds": pd.date_range(train["ts"].max() + step_td, periods=steps, freq=freq),
         "yhat": fcast.predicted_mean.values,
         "yhat_lower": ci.iloc[:, 0].values,
         "yhat_upper": ci.iloc[:, 1].values,
@@ -323,10 +348,12 @@ def forecast_sarima(
 
 # ─── Chart helpers ─────────────────────────────────────────────────────────────
 
-def _forecast_chart(train, test, fc, test_days, horizon_days, model_name) -> go.Figure:
+def _forecast_chart(train, test, fc, test_days, horizon_days, model_name,
+                    hist_rows: int = 365) -> go.Figure:
     fig = go.Figure()
+    train_plot = train.tail(hist_rows)
     fig.add_trace(go.Scatter(
-        x=train.tail(365)["ds"], y=train.tail(365)["y"],
+        x=train_plot["ds"], y=train_plot["y"],
         name="Historical", line=dict(color="#4C78A8", width=1.5),
     ))
     if not test.empty:
@@ -649,22 +676,51 @@ _MODEL_OPTIONS = ["Seasonal Naive", "Holt-Winters (ETS)", "SARIMA", "Prophet"]
 
 def _tab_forecast(df: pd.DataFrame) -> None:
     st.subheader("Demand Forecast")
-    st.caption("Trains on **daily-averaged** demand. Model fit on all loaded data minus the test window.")
 
+    # ── Resolution ──────────────────────────────────────────────────────────
+    res_col, _, _ = st.columns([2, 2, 2])
+    with res_col:
+        freq = st.radio(
+            "Resolution",
+            ["1D", "30min"],
+            format_func=lambda f: "Daily (averaged)" if f == "1D" else "30-minute (raw intervals)",
+            horizontal=True,
+            key="fc_freq",
+        )
+
+    spd = _STEPS_PER_DAY[freq]  # intervals per day
+
+    if freq == "1D":
+        st.caption("Trains on **daily-averaged** demand.")
+    else:
+        st.caption(
+            "Trains on **raw 30-minute intervals**. "
+            "ETS uses S=48 (daily cycle, last 365d of data). "
+            "SARIMA uses s=48 (last 180d). "
+            "Naive uses S=336 (same slot last week). "
+            "Prophet captures both daily and weekly seasonality."
+        )
+
+    # ── Model + sliders ─────────────────────────────────────────────────────
     c1, c2, c3 = st.columns(3)
     with c1:
         model_name = st.selectbox("Model", _MODEL_OPTIONS, key="fc_model")
     with c2:
         test_days = st.slider("Test window (days)", 7, 90, 30, key="fc_test")
     with c3:
-        horizon = st.slider("Forecast horizon (days)", 7, 180, 60, key="fc_horizon")
+        horizon = st.slider("Forecast horizon (days)", 7, 90 if freq == "30min" else 180, 14 if freq == "30min" else 60, key="fc_horizon")
 
-    # SARIMA-specific order controls
+    # ── Model-specific controls ──────────────────────────────────────────────
     sarima_params: dict = {}
     if model_name == "SARIMA":
-        with st.expander("SARIMA order  (p,d,q)(P,D,Q)[7]", expanded=True):
-            st.caption("Non-seasonal (p,d,q) and seasonal (P,D,Q) orders. Seasonal period s is fixed to **7** (weekly).")
-            a1, a2, a3, a4, a5, a6 = st.columns(6)
+        default_s = 48 if freq == "30min" else 7
+        label = f"SARIMA order  (p,d,q)(P,D,Q)[s]  —  s default {default_s} ({'daily' if freq == '30min' else 'weekly'})"
+        with st.expander(label, expanded=True):
+            st.caption(
+                "Non-seasonal **(p,d,q)** and seasonal **(P,D,Q)** orders. "
+                f"Seasonal period **s** defaults to {default_s} for {freq} data — override if needed."
+            )
+            a1, a2, a3, a4, a5, a6, a7 = st.columns(7)
             sarima_params = {
                 "p": a1.number_input("p", 0, 3, 1, key="fc_p"),
                 "d": a2.number_input("d", 0, 2, 1, key="fc_d"),
@@ -672,18 +728,27 @@ def _tab_forecast(df: pd.DataFrame) -> None:
                 "P": a4.number_input("P", 0, 2, 1, key="fc_P"),
                 "D": a5.number_input("D", 0, 2, 1, key="fc_D"),
                 "Q": a6.number_input("Q", 0, 2, 1, key="fc_Q"),
+                "s": a7.number_input("s", 1, 336, default_s, key="fc_s"),
             }
 
-    # Seasonal Naive seasonality toggle
-    naive_season = 7
+    naive_season = 336 if freq == "30min" else 7
     if model_name == "Seasonal Naive":
-        naive_season = st.radio(
-            "Seasonal period",
-            [7, 365],
-            format_func=lambda s: f"Weekly (S={s})" if s == 7 else f"Yearly (S={s}, needs ≥2y data)",
-            horizontal=True,
-            key="fc_naive_season",
-        )
+        if freq == "30min":
+            naive_season = st.radio(
+                "Seasonal period",
+                [336, 48],
+                format_func=lambda s: "Weekly (S=336, same slot last week)" if s == 336 else "Daily (S=48, same slot yesterday)",
+                horizontal=True,
+                key="fc_naive_season",
+            )
+        else:
+            naive_season = st.radio(
+                "Seasonal period",
+                [7, 365],
+                format_func=lambda s: f"Weekly (S={s})" if s == 7 else f"Yearly (S={s}, needs ≥2y data)",
+                horizontal=True,
+                key="fc_naive_season",
+            )
 
     run_btn = st.button("Run forecast", type="primary", key="fc_run")
 
@@ -692,24 +757,34 @@ def _tab_forecast(df: pd.DataFrame) -> None:
         return
 
     if run_btn:
-        daily = _to_daily(df)
+        # Prepare data at the chosen resolution
+        if freq == "1D":
+            data = _to_daily(df)
+        else:
+            data = (df[["ts", "operational_demand_mw"]].copy()
+                    .sort_values("ts")
+                    .assign(ts=lambda x: x["ts"].dt.tz_localize(None)))
+
         buf = io.BytesIO()
-        daily[["ts", "operational_demand_mw"]].to_parquet(buf, index=False)
+        data[["ts", "operational_demand_mw"]].to_parquet(buf, index=False)
         parquet_bytes = buf.getvalue()
 
-        with st.spinner(f"Running {model_name}…"):
+        with st.spinner(f"Running {model_name} at {freq} resolution…"):
             try:
                 if model_name == "Prophet":
-                    train, test, fc, metrics = forecast_prophet(parquet_bytes, test_days, horizon)
+                    train, test, fc, metrics = forecast_prophet(parquet_bytes, test_days, horizon, freq=freq)
                 elif model_name == "Holt-Winters (ETS)":
-                    train, test, fc, metrics = forecast_ets(parquet_bytes, test_days, horizon)
+                    train, test, fc, metrics = forecast_ets(parquet_bytes, test_days, horizon, freq=freq)
                 elif model_name == "Seasonal Naive":
-                    train, test, fc, metrics = forecast_naive(parquet_bytes, test_days, horizon, season=naive_season)
+                    train, test, fc, metrics = forecast_naive(parquet_bytes, test_days, horizon,
+                                                              season=naive_season, freq=freq)
                 else:  # SARIMA
                     train, test, fc, metrics = forecast_sarima(
-                        parquet_bytes, test_days, horizon, **{k: int(v) for k, v in sarima_params.items()}
+                        parquet_bytes, test_days, horizon,
+                        **{k: int(v) for k, v in sarima_params.items()},
+                        freq=freq,
                     )
-                st.session_state["fc_result"] = (train, test, fc, metrics, model_name, horizon, test_days)
+                st.session_state["fc_result"] = (train, test, fc, metrics, model_name, horizon, test_days, freq)
             except ImportError as exc:
                 lib = "prophet" if model_name == "Prophet" else "statsmodels"
                 st.error(f"{model_name} not installed. Run: `pip install {lib}`\n\n`{exc}`")
@@ -718,7 +793,10 @@ def _tab_forecast(df: pd.DataFrame) -> None:
                 st.error(f"Forecast failed: {exc}")
                 return
 
-    train, test, fc, metrics, model_name, horizon, test_days = st.session_state["fc_result"]
+    result = st.session_state["fc_result"]
+    train, test, fc, metrics, model_name, horizon, test_days = result[:7]
+    saved_freq = result[7] if len(result) > 7 else "1D"
+    saved_spd  = _STEPS_PER_DAY[saved_freq]
 
     if metrics:
         m1, m2, m3 = st.columns(3)
@@ -726,17 +804,21 @@ def _tab_forecast(df: pd.DataFrame) -> None:
         m2.metric("RMSE", f"{metrics.get('RMSE (MW)', 0):,.1f} MW")
         m3.metric("MAPE", f"{metrics.get('MAPE (%)', 0):.2f} %")
 
-    st.plotly_chart(_forecast_chart(train, test, fc, test_days, horizon, model_name),
-                    use_container_width=True)
+    # Show last 90 days of history at 30-min (=4 320 rows), last 365 days at daily
+    hist_rows = 90 * saved_spd
+    st.plotly_chart(
+        _forecast_chart(train, test, fc, test_days, horizon, model_name, hist_rows=hist_rows),
+        use_container_width=True,
+    )
 
     future_only = fc[fc["ds"] > (test["ds"].max() if not test.empty else train["ds"].max())].copy()
-    future_only.columns = ["date", "forecast_mw", "lower_95_mw", "upper_95_mw"]
+    future_only.columns = ["datetime", "forecast_mw", "lower_95_mw", "upper_95_mw"]
     st.download_button(f"Download {horizon}-day forecast CSV",
                        future_only.to_csv(index=False).encode(),
                        "aemo_forecast.csv", "text/csv")
 
     with st.expander("Full forecast table"):
-        st.dataframe(fc.rename(columns={"ds": "date", "yhat": "forecast_mw",
+        st.dataframe(fc.rename(columns={"ds": "datetime", "yhat": "forecast_mw",
                                         "yhat_lower": "lower_95_mw", "yhat_upper": "upper_95_mw"}),
                      use_container_width=True)
 
